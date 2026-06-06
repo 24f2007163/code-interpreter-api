@@ -1,33 +1,40 @@
-from fastapi import FastAPI
+# api/index.py
+
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
 from io import StringIO
 import traceback
 import sys
-import os
-import json
-import httpx
+import re
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    expose_headers=["Access-Control-Allow-Origin"],
 )
+
 
 class CodeRequest(BaseModel):
     code: str
 
 
 def execute_python_code(code: str):
+    """
+    Execute Python code and return exact output.
+    """
 
     old_stdout = sys.stdout
     sys.stdout = StringIO()
 
     try:
         exec(code)
+
         output = sys.stdout.getvalue()
 
         return {
@@ -48,75 +55,56 @@ def execute_python_code(code: str):
         sys.stdout = old_stdout
 
 
-async def analyze_error_with_ai(code, tb):
+async def analyze_error_with_ai(code: str, tb: str):
+    """
+    Extract line numbers from traceback.
+    More reliable than calling an LLM on Vercel.
+    """
 
-    prompt = f"""
-Analyze this Python code and traceback.
+    matches = re.findall(r'line (\d+)', tb)
 
-CODE:
-{code}
+    if matches:
+        return [int(matches[-1])]
 
-TRACEBACK:
-{tb}
+    return []
 
-Return ONLY JSON:
 
-{{"error_lines":[line_numbers]}}
-"""
+@app.get("/")
+def home():
+    return {"status": "ok"}
 
-    async with httpx.AsyncClient() as client:
 
-        response = await client.post(
-            "https://aipipe.org/openai/v1/chat/completions",
-            headers={
-                "Authorization":
-                f"Bearer {os.environ['AIPIPE_TOKEN']}"
-            },
-            json={
-                "model": "openai/gpt-4.1-nano",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "response_format": {
-                    "type": "json_object"
-                }
-            }
-        )
-
-    data = response.json()
-
-    content = (
-        data["choices"][0]
-        ["message"]["content"]
-    )
-
-    try:
-        return json.loads(content)["error_lines"]
-    except:
-        return []
+@app.options("/{path:path}")
+def options_handler(path: str):
+    return Response()
 
 
 @app.post("/code-interpreter")
 async def code_interpreter(req: CodeRequest):
 
-    execution = execute_python_code(req.code)
+    try:
 
-    if execution["success"]:
+        execution = execute_python_code(req.code)
+
+        if execution["success"]:
+            return {
+                "error": [],
+                "result": execution["output"]
+            }
+
+        lines = await analyze_error_with_ai(
+            req.code,
+            execution["output"]
+        )
 
         return {
-            "error": [],
+            "error": lines,
             "result": execution["output"]
         }
 
-    lines = await analyze_error_with_ai(
-        req.code,
-        execution["output"]
-    )
+    except Exception as e:
 
-    return {
-        "error": lines,
-        "result": execution["output"]
-    }
+        return {
+            "error": [],
+            "result": str(e)
+        }
